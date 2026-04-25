@@ -1,0 +1,31 @@
+# Secrets — NEVER commit these
+.env
+*.db
+*.pkl
+*.parquet
+
+# Cache & logs
+data_cache/
+models/saved/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+backtest_results.json
+
+# Python
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
