@@ -60,9 +60,9 @@ CHARGES_PER     = config.CHARGES_PER_TRADE
 TARGET_GROSS    = config.TARGET_GROSS_DAILY
 SYMBOLS         = config.WATCHLIST
 
-# NSE session times (UTC+5:30 → we compare hour/minute in tz-naive index)
+# NSE session times
 SESSION_START   = dtime(9, 15)
-SESSION_END     = dtime(15, 15)   # force-close at 15:15 (last entry no later than 14:45)
+SESSION_END     = dtime(15, 15)   # force-close at 15:15
 ENTRY_CUTOFF    = dtime(14, 45)   # no new entries after this
 
 # ── Data loader ──────────────────────────────────────────────────────────────
@@ -115,6 +115,7 @@ def _download_one(symbol: str, days: int) -> tuple:
         return symbol, pd.DataFrame()
 
     df = pd.concat(chunks)
+    # Deduplicate timestamps from overlapping chunks
     df = df[~df.index.duplicated(keep="first")].sort_index()
     df.to_parquet(cache_path)
     p(f"  saved {symbol}: {len(df)} bars")
@@ -131,19 +132,22 @@ def load_all_data(symbols: list, days: int = BACKTEST_DAYS) -> dict:
     return all_data
 
 # ── Signals ───────────────────────────────────────────────────────────────────
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    prev_c = df["close"].shift(1)
-    tr = pd.concat([
-        df["high"] - df["low"],
-        (df["high"] - prev_c).abs(),
-        (df["low"] - prev_c).abs(),
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
+def _atr_numpy(df: pd.DataFrame, period: int = 14) -> np.ndarray:
+    """Compute ATR using numpy (avoids pd.concat duplicate-index issues)."""
+    hi = df["high"].values.astype(float)
+    lo = df["low"].values.astype(float)
+    cl = df["close"].values.astype(float)
+    prev_c = np.roll(cl, 1); prev_c[0] = cl[0]
+    tr = np.maximum(hi - lo, np.maximum(np.abs(hi - prev_c), np.abs(lo - prev_c)))
+    atr = pd.Series(tr).rolling(period, min_periods=1).mean().values
+    return atr
 
 def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
+    # Always deduplicate before feature computation
+    df = df[~df.index.duplicated(keep="first")].copy()
     fe = FeatureEngine()
     df = fe.compute(df)
-    df["atr14"] = _atr(df, period=14)
+    df["atr14"] = _atr_numpy(df, period=14)
     return df
 
 def _signal_score(row: pd.Series) -> float:
@@ -218,7 +222,7 @@ class BacktestEngine:
             if len(df) < 30:
                 continue
             try:
-                signals[sym] = compute_signals(df.copy())
+                signals[sym] = compute_signals(df)
                 if i % 5 == 0:
                     p(f"  signals {i}/{len(all_data)}")
             except Exception as exc:
@@ -237,26 +241,27 @@ class BacktestEngine:
                 p(f"  day {day_idx}/{total_days} ({day}) capital=Rs{capital:,.0f}")
 
             regime = regime_map.get(day, "Sideways")
-            # Skip bear days
             if regime == "Bear":
                 continue
 
             threshold = 0.45 if regime == "Sideways" else SIGNAL_THRESH
 
-            # Collect all 15m bars for this day across all symbols, sorted by time
+            # Collect 15m bars for this day
             day_bars = {}
             for sym, df in signals.items():
-                mask = pd.to_datetime(df.index).date == day
-                bars = df[mask].copy()
-                # Filter session hours
-                bars = bars[bars.index.map(lambda t: SESSION_START <= t.time() <= SESSION_END)]
-                if not bars.empty:
-                    day_bars[sym] = bars
+                try:
+                    mask = np.array([ts.date() == day for ts in df.index])
+                    bars = df.iloc[mask]
+                    bars = bars[bars.index.map(lambda t: SESSION_START <= t.time() <= SESSION_END)]
+                    if not bars.empty:
+                        day_bars[sym] = bars
+                except Exception:
+                    pass
 
             if not day_bars:
                 continue
 
-            # Build sorted timeline of all bar timestamps this day
+            # Build sorted timeline
             all_ts = sorted({ts for bars in day_bars.values() for ts in bars.index})
 
             open_positions = {}
@@ -267,7 +272,7 @@ class BacktestEngine:
             for ts in all_ts:
                 bar_time = ts.time()
 
-                # Force-close all positions at session end
+                # Force-close all at session end
                 if bar_time >= SESSION_END:
                     for sym, pos in list(open_positions.items()):
                         bars = day_bars.get(sym)
@@ -283,7 +288,7 @@ class BacktestEngine:
                     open_positions.clear()
                     break
 
-                # Check SL/TP for open positions
+                # Check SL/TP
                 to_close = []
                 for sym, pos in open_positions.items():
                     bars = day_bars.get(sym)
@@ -311,7 +316,7 @@ class BacktestEngine:
                 if daily_pnl_net <= -MAX_DAILY_LOSS:
                     break
 
-                # Entry logic (only before cutoff)
+                # Entry logic
                 if bar_time >= ENTRY_CUTOFF:
                     continue
                 if len(open_positions) >= MAX_POS:
@@ -466,9 +471,9 @@ def print_report(r: dict, label: str = "RESULT") -> None:
               f"Net=Rs{row['net_pnl']:>8,.0f}  Trades={int(row['num_trades'])}")
     p("")
     if r["avg_net_day"] >= TARGET_GROSS - 500:
-        p(f"  System MEETS Rs{TARGET_GROSS-500:,.0f}/day net target ✓")
+        p(f"  System MEETS Rs{TARGET_GROSS-500:,.0f}/day net target")
     else:
-        p(f"  Net/day Rs{r['avg_net_day']:,.0f} — below Rs{TARGET_GROSS-500:,.0f} target")
+        p(f"  Net/day Rs{r['avg_net_day']:,.0f} -- below Rs{TARGET_GROSS-500:,.0f} target")
     p("")
 
 # ── Save results ─────────────────────────────────────────────────────────────
