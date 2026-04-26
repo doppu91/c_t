@@ -84,7 +84,11 @@ def _download_one(symbol: str, years: int) -> tuple:
         )
         if raw.empty:
             raise ValueError("Empty response")
-        raw.columns = [c.lower() for c in raw.columns]
+        # Fix for yfinance >= 0.2.40 MultiIndex columns
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [col[0].lower() for col in raw.columns]
+        else:
+            raw.columns = [c.lower() if isinstance(c, str) else str(c[0]).lower() for c in raw.columns]
         df = raw[["open", "high", "low", "close", "volume"]].dropna()
         df.to_parquet(cache_path)
         p(f"  saved {symbol}: {len(df)} bars")
@@ -280,7 +284,10 @@ class BacktestEngine:
         try:
             raw = yf.download("^NSEI", period=f"{BACKTEST_YEARS}y",
                               interval="1d", progress=False)
-            raw.columns = [c.lower() for c in raw.columns]
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [col[0].lower() for col in raw.columns]
+            else:
+                raw.columns = [c.lower() if isinstance(c, str) else str(c[0]).lower() for c in raw.columns]
             nifty = raw[["open", "high", "low", "close", "volume"]].dropna()
         except Exception:
             nifty = list(all_data.values())[0] if all_data else pd.DataFrame()
